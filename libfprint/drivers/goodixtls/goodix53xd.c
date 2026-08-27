@@ -751,6 +751,17 @@ static void fpi_device_goodixtls53xd_init(FpiDeviceGoodixTls53XD* self)
     self->frames = g_slist_alloc();
 }
 
+/* The TLS PSK is 32 zero bytes for the 538d (after the sensor has been
+ * initialized with goodix-fp-dump). This is distinct from goodix_53xd_psk_0,
+ * which is the preset_psk verification hash (sha256 of these zeros) that the
+ * driver compares against the device's preset_psk_read reply. */
+static const guint8 goodix_53xd_tls_psk[32] = {0};
+
+static const guint8* goodix53xd_get_psk(guint16* len) {
+  *len = sizeof(goodix_53xd_tls_psk);
+  return goodix_53xd_tls_psk;
+}
+
 static void fpi_device_goodixtls53xd_class_init(
     FpiDeviceGoodixTls53XDClass *class) {
   FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS(class);
@@ -760,6 +771,7 @@ static void fpi_device_goodixtls53xd_class_init(
   gx_class->interface = GOODIX_53XD_INTERFACE;
   gx_class->ep_in = GOODIX_53XD_EP_IN;
   gx_class->ep_out = GOODIX_53XD_EP_OUT;
+  gx_class->get_psk = goodix53xd_get_psk;
 
   dev_class->id = "goodixtls53xd";
   dev_class->full_name = "Goodix TLS Fingerprint Sensor 53XD";
@@ -767,9 +779,9 @@ static void fpi_device_goodixtls53xd_class_init(
   dev_class->id_table = id_table;
 
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->nr_enroll_stages = 10;
 
-  // TODO
-  img_dev_class->bz3_threshold = 24;
+  img_dev_class->bz3_threshold = 18;
   img_dev_class->img_width = GOODIX53XD_WIDTH;
   img_dev_class->img_height = GOODIX53XD_HEIGHT;
 

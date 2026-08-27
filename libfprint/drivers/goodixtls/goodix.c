@@ -53,6 +53,12 @@ typedef struct {
 
     GoodixCallbackInfo* tls_ready_callback;
 
+    /* Pending image-read request, resent after (re)establishing TLS. */
+    guint8* pending_img_payload;
+    guint16 pending_img_len;
+    GoodixCallbackInfo* pending_img_cb;
+    guint pending_img_retries;
+
     GCancellable* transfer_cancel_tkn;
     gboolean inited;
 } FpiDeviceGoodixTlsPrivate;
@@ -277,6 +283,12 @@ void goodix_receive_ack(FpDevice *dev, guint8 *data, guint16 length,
   priv->ack = FALSE;
 }
 
+static void goodix_send_pending_image(FpDevice* dev, gpointer user_data,
+                                      GError* error);
+static void do_tls_handshake(FpDevice* dev);
+static void on_goodix_tls_server_ready(GoodixTlsServer* server, GError* err,
+                                       gpointer dev);
+
 void goodix_receive_protocol(FpDevice *dev, guint8 *data, guint32 length) {
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS(dev);
   FpiDeviceGoodixTlsPrivate *priv =
@@ -298,6 +310,50 @@ void goodix_receive_protocol(FpDevice *dev, guint8 *data, guint32 length) {
       fp_dbg("got ack");
       goodix_receive_ack(dev, payload, payload_len, NULL, NULL);
       return;
+  }
+
+  /* The MCU drops the TLS session while it waits for the finger and, upon
+   * receiving our 0x20 image read, replies 0xd0 (REQUEST_TLS) to begin a new
+   * handshake. We must follow it: feed the 0xd0 payload into the TLS client
+   * and run the handshake, then resend the pending image request. */
+  if (cmd == GOODIX_CMD_REQUEST_TLS_CONNECTION &&
+      priv->cmd == GOODIX_CMD_MCU_GET_IMAGE && priv->pending_img_cb &&
+      priv->pending_img_retries < 10) {
+    fp_warn("MCU renegotiating TLS during image read, retrying (%u)",
+            priv->pending_img_retries + 1);
+    priv->pending_img_retries++;
+    if (priv->tls_hop) {
+      goodix_shutdown_tls(dev, NULL);
+    }
+    priv->tls_hop = malloc(sizeof(GoodixTlsServer));
+    priv->tls_hop->connection_callback = on_goodix_tls_server_ready;
+    priv->tls_hop->user_data = self;
+
+    FpiDeviceGoodixTlsClass* gx_class = FPI_DEVICE_GOODIXTLS_GET_CLASS(self);
+    if (gx_class->get_psk) {
+      guint16 plen = 0;
+      priv->tls_hop->psk = gx_class->get_psk(&plen);
+      priv->tls_hop->psk_len = plen;
+    } else {
+      priv->tls_hop->psk = NULL;
+      priv->tls_hop->psk_len = 0;
+    }
+
+    if (!priv->tls_ready_callback) {
+      priv->tls_ready_callback = malloc(sizeof(GoodixCallbackInfo));
+    }
+    priv->tls_ready_callback->callback = G_CALLBACK(goodix_send_pending_image);
+    priv->tls_ready_callback->user_data = dev;
+    GError* terr = NULL;
+    if (!goodix_tls_server_init(priv->tls_hop, &terr)) {
+      fp_err("failed to init tls server for scan: %s", terr->message);
+      goodix_send_pending_image(dev, NULL, terr);
+      return;
+    }
+    /* Feed the 0xd0 payload into the TLS server and run the handshake. */
+    goodix_tls_client_send(priv->tls_hop, payload, payload_len);
+    do_tls_handshake(dev);
+    return;
   }
 
   if (priv->cmd != cmd) {
@@ -1105,8 +1161,6 @@ static void on_goodix_tls_read_handshake(FpDevice* dev, guint8* data,
                                          guint16 length, gpointer user_data,
                                          GError* error)
 {
-    //   goodix_tls_handshake_state* state = (goodix_tls_handshake_state*)
-    //   user_data;
     FpiSsm* ssm = user_data;
     if (error) {
         fpi_ssm_mark_failed(ssm, error);
@@ -1261,6 +1315,17 @@ void goodix_tls(FpDevice* dev, GoodixNoneCallback callback, gpointer user_data)
     GoodixTlsServer* s = priv->tls_hop;
     s->connection_callback = on_goodix_tls_server_ready;
     s->user_data = self;
+
+    FpiDeviceGoodixTlsClass* gx_class = FPI_DEVICE_GOODIXTLS_GET_CLASS(self);
+    if (gx_class->get_psk) {
+      guint16 plen = 0;
+      s->psk = gx_class->get_psk(&plen);
+      s->psk_len = plen;
+    } else {
+      s->psk = NULL;
+      s->psk_len = 0;
+    }
+
     GError* err = NULL;
     if (!goodix_tls_server_init(priv->tls_hop, &err)) {
         fp_err("failed to init tls server, error: %s, code: %d", err->message,
@@ -1317,15 +1382,54 @@ static void goodix_tls_ready_image_handler(FpDevice* dev, guint8* data,
 }
 
 void goodix_tls_read_image(FpDevice* dev, guint8* payload, guint16 length, GoodixImageCallback callback,
-                           gpointer user_data)
-{
+                           gpointer user_data){
     g_assert(callback);
+    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
+    FpiDeviceGoodixTlsPrivate* priv =
+        fpi_device_goodixtls_get_instance_private(self);
     GoodixCallbackInfo* cb_info = malloc(sizeof(GoodixCallbackInfo));
 
     cb_info->callback = G_CALLBACK(callback);
     cb_info->user_data = user_data;
 
-    goodix_send_mcu_get_image(dev, payload, length, goodix_tls_ready_image_handler, cb_info);
+    /* The MCU drops the TLS session while it waits for the finger, so build a
+     * fresh TLS session before each image read, then send the pending request
+     * once the handshake completes. */
+    GError* derr = NULL;
+    goodix_shutdown_tls(dev, &derr);
+
+    g_free(priv->pending_img_payload);
+    priv->pending_img_payload = g_memdup(payload, length);
+    priv->pending_img_len = length;
+    priv->pending_img_cb = cb_info;
+    priv->pending_img_retries = 0;
+
+    goodix_tls(dev, goodix_send_pending_image, dev);
+}
+
+static void goodix_send_pending_image(FpDevice* dev, gpointer user_data,
+                                      GError* error)
+{
+    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
+    FpiDeviceGoodixTlsPrivate* priv =
+        fpi_device_goodixtls_get_instance_private(self);
+    GoodixCallbackInfo* cb_info = priv->pending_img_cb;
+
+    if (error) {
+        ((GoodixImageCallback) cb_info->callback)(
+            dev, NULL, 0, cb_info->user_data, error);
+        g_free(cb_info);
+        g_clear_pointer(&priv->pending_img_payload, g_free);
+        priv->pending_img_cb = NULL;
+        return;
+    }
+
+    /* Resend the image request over the now-negotiated TLS session. The MCU
+     * answers with TLS-encrypted image data that goodix_tls_ready_image_handler
+     * proxies back to us when the 0x20 completes. */
+    goodix_send_mcu_get_image(dev, priv->pending_img_payload,
+                              priv->pending_img_len,
+                              goodix_tls_ready_image_handler, cb_info);
 }
 
 // ---- TLS SECTION END ----

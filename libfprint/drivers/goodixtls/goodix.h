@@ -33,6 +33,10 @@ struct _FpiDeviceGoodixTlsClass {
   gint interface;
   guint8 ep_in;
   guint8 ep_out;
+
+  /* Returns the device-specific PSK to feed the local TLS server proxy.
+   * If NULL, a zero PSK is used (legacy behaviour for the 511). */
+  const guint8* (*get_psk)(guint16* len);
 };
 
 typedef struct __attribute__((__packed__)) _GoodixCallbackInfo {

@@ -68,6 +68,11 @@ typedef struct _GoodixTlsServer {
     // SSL* cli_ssl_layer;
     int client_fd;
     pthread_t serve_thread;
+
+    /* Device-specific PSK used by the local TLS server proxy to derive
+     * session keys matching the MCU. Set by the driver before init. */
+    const guint8* psk;
+    guint16 psk_len;
 } GoodixTlsServer;
 
 // This is called only once to init the TLS server.

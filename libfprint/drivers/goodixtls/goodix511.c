@@ -724,6 +724,11 @@ static void fpi_device_goodixtls511_init(FpiDeviceGoodixTls511* self)
     self->frames = g_slist_alloc();
 }
 
+static const guint8* goodix511_get_psk(guint16* len) {
+  *len = sizeof(goodix_511_psk_0);
+  return goodix_511_psk_0;
+}
+
 static void fpi_device_goodixtls511_class_init(
     FpiDeviceGoodixTls511Class *class) {
   FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS(class);
@@ -733,6 +738,7 @@ static void fpi_device_goodixtls511_class_init(
   gx_class->interface = GOODIX_511_INTERFACE;
   gx_class->ep_in = GOODIX_511_EP_IN;
   gx_class->ep_out = GOODIX_511_EP_OUT;
+  gx_class->get_psk = goodix511_get_psk;
 
   dev_class->id = "goodixtls511";
   dev_class->full_name = "Goodix TLS Fingerprint Sensor 511";
