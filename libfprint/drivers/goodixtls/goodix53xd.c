@@ -592,9 +592,7 @@ static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
 
 static void scan_get_img(FpDevice* dev, FpiSsm* ssm)
 {
-    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
-    guint8 payload[] = {0x41, 0x03, self->otp[26], 0x00, self->otp[26] - 6, 0x00, self->otp[45], 0x00, self->otp[45] - 4, 0x00};
+    guint8 payload[] = {0x41, 0x03, 0xa5, 0x00, 0x9f, 0x00, 0xa5, 0x00, 0xa1, 0x00};
     goodix_tls_read_image(dev, payload, sizeof(payload), scan_on_read_img, ssm);
 }
 
@@ -615,7 +613,6 @@ guint8 fdt_switch_state_down_53xd[] = {
 static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
 {
     FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
 
 
     switch (fpi_ssm_get_cur_state(ssm)) {
@@ -627,12 +624,6 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
 
     case SCAN_STAGE_SWITCH_TO_FDT_DOWN:
-        // FDT Down Cali
-        fdt_switch_state_down_53xd[2] = self->otp[33];
-        fdt_switch_state_down_53xd[4] = self->otp[41];
-        fdt_switch_state_down_53xd[6] = self->otp[42];
-        fdt_switch_state_down_53xd[8] = self->otp[43];
-
         // First FDT down must not send a reply
         fdt_switch_state_down_53xd[26] = 0x00;
         goodix_send_mcu_switch_to_fdt_down(dev, (guint8*) fdt_switch_state_down_53xd,
