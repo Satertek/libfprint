@@ -80,6 +80,7 @@ fp_print_finalize (GObject *object)
   g_clear_pointer (&self->enroll_date, g_date_free);
   g_clear_pointer (&self->data, g_variant_unref);
   g_clear_pointer (&self->prints, g_ptr_array_unref);
+  g_clear_pointer (&self->ridge_templates, g_ptr_array_unref);
 
   G_OBJECT_CLASS (fp_print_parent_class)->finalize (object);
 }
@@ -676,8 +677,29 @@ fp_print_serialize (FpPrint *print,
   else
     g_variant_builder_add (&builder, "i", G_MININT32);
 
-  /* Unused a{sv} for expansion */
+  /* a{sv} for expansion */
   g_variant_builder_open (&builder, G_VARIANT_TYPE_VARDICT);
+  if (print->ridge_templates && print->ridge_templates->len > 0)
+    {
+      GVariantBuilder ridge_b = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("a(iiay)"));
+      guint i;
+
+      for (i = 0; i < print->ridge_templates->len; i++)
+        {
+          FpiRidgeMap *rm = g_ptr_array_index (print->ridge_templates, i);
+
+          g_variant_builder_open (&ridge_b, G_VARIANT_TYPE ("(iiay)"));
+          g_variant_builder_add (&ridge_b, "i", rm->width);
+          g_variant_builder_add (&ridge_b, "i", rm->height);
+          g_variant_builder_add_value (&ridge_b,
+                                       g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                                  rm->data,
+                                                                  rm->width * rm->height,
+                                                                  sizeof (guchar)));
+          g_variant_builder_close (&ridge_b);
+        }
+      g_variant_builder_add (&builder, "{sv}", "ridge-templates", g_variant_builder_end (&ridge_b));
+    }
   g_variant_builder_close (&builder);
 
   /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
@@ -765,6 +787,7 @@ fp_print_deserialize (const guchar *data,
   g_autoptr(GVariant) raw_value = NULL;
   g_autoptr(GVariant) value = NULL;
   g_autoptr(GVariant) print_data = NULL;
+  g_autoptr(GVariant) extensions = NULL;
   g_autoptr(GDate) date = NULL;
   guchar *aligned_data = NULL;
   guint8 finger_int8;
@@ -815,7 +838,7 @@ fp_print_deserialize (const guchar *data,
                  &username,
                  &description,
                  &julian_date,
-                 NULL,
+                 &extensions,
                  &print_data);
 
   finger = finger_int8;
@@ -868,6 +891,39 @@ fp_print_deserialize (const guchar *data,
           memcpy (xyt->thetacol, thetacol, sizeof (xcol[0]) * xlen);
 
           g_ptr_array_add (result->prints, g_steal_pointer (&xyt));
+        }
+
+      if (extensions)
+        {
+          g_autoptr(GVariant) ridge_v = g_variant_lookup_value (extensions, "ridge-templates", G_VARIANT_TYPE ("a(iiay)"));
+          if (ridge_v)
+            {
+              guint r_idx, n_ridges = g_variant_n_children (ridge_v);
+
+              if (!result->ridge_templates)
+                result->ridge_templates = g_ptr_array_new_with_free_func (fpi_ridge_map_free);
+
+              for (r_idx = 0; r_idx < n_ridges; r_idx++)
+                {
+                  g_autoptr(GVariant) child = g_variant_get_child_value (ridge_v, r_idx);
+                  gint w, h;
+                  g_autoptr(GVariant) bytes_v = NULL;
+                  g_variant_get (child, "(ii@ay)", &w, &h, &bytes_v);
+                  if (bytes_v && w > 0 && h > 0)
+                    {
+                      gsize n_bytes = 0;
+                      const guchar *bytes = g_variant_get_fixed_array (bytes_v, &n_bytes, sizeof (guchar));
+                      if (bytes && n_bytes == (gsize) (w * h))
+                        {
+                          FpiRidgeMap *rm = g_new0 (FpiRidgeMap, 1);
+                          rm->width = w;
+                          rm->height = h;
+                          rm->data = g_memdup2 (bytes, n_bytes);
+                          g_ptr_array_add (result->ridge_templates, rm);
+                        }
+                    }
+                }
+            }
         }
     }
   else if (type == FPI_PRINT_RAW)

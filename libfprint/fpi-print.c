@@ -21,6 +21,7 @@
 #define FP_COMPONENT "print"
 #include "fpi-log.h"
 
+#include <math.h>
 #include "fp-print-private.h"
 #include "fpi-device.h"
 #include "fpi-compat.h"
@@ -51,6 +52,22 @@ fpi_print_add_print (FpPrint *print, FpPrint *add)
 
   g_assert (add->prints->len == 1);
   g_ptr_array_add (print->prints, g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)));
+
+  if (add->ridge_templates)
+    {
+      guint j;
+      if (!print->ridge_templates)
+        print->ridge_templates = g_ptr_array_new_with_free_func (fpi_ridge_map_free);
+      for (j = 0; j < add->ridge_templates->len; j++)
+        {
+          FpiRidgeMap *orig = g_ptr_array_index (add->ridge_templates, j);
+          FpiRidgeMap *copy = g_new0 (FpiRidgeMap, 1);
+          copy->width = orig->width;
+          copy->height = orig->height;
+          copy->data = g_memdup2 (orig->data, orig->width * orig->height);
+          g_ptr_array_add (print->ridge_templates, copy);
+        }
+    }
 }
 
 /**
@@ -75,6 +92,8 @@ fpi_print_set_type (FpPrint     *print,
     {
       g_assert_null (print->prints);
       print->prints = g_ptr_array_new_with_free_func (g_free);
+      if (!print->ridge_templates)
+        print->ridge_templates = g_ptr_array_new_with_free_func (fpi_ridge_map_free);
     }
   g_object_notify (G_OBJECT (print), "fpi-type");
 }
@@ -151,6 +170,20 @@ minutiae_to_xyt (struct fp_minutiae *minutiae,
  *
  * Returns: %TRUE on success
  */
+/**
+ * fpi_print_add_from_image:
+ * @print: A #FpPrint
+ * @image: A #FpImage
+ * @error: Return location for error
+ *
+ * Extracts the minutiae and/or ridge map from the given image and adds it to @print of
+ * type #FPI_PRINT_NBIS.
+ *
+ * The @image will be kept so that API users can get retrieve it e.g.
+ * for debugging purposes.
+ *
+ * Returns: %TRUE on success
+ */
 gboolean
 fpi_print_add_from_image (FpPrint *print,
                           FpImage *image,
@@ -170,22 +203,33 @@ fpi_print_add_from_image (FpPrint *print,
     }
 
   minutiae = fp_image_get_minutiae (image);
-  if (!minutiae || minutiae->len == 0)
+  if (minutiae && minutiae->len > 0)
     {
-      g_set_error (error,
-                   G_IO_ERROR,
-                   G_IO_ERROR_INVALID_DATA,
-                   "No minutiae found in image or not yet detected!");
-      return FALSE;
+      _minutiae.num = minutiae->len;
+      _minutiae.list = (struct fp_minutia **) minutiae->pdata;
+      _minutiae.alloc = minutiae->len;
+
+      xyt = g_new0 (struct xyt_struct, 1);
+      minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
+      g_ptr_array_add (print->prints, xyt);
+    }
+  else
+    {
+      xyt = g_new0 (struct xyt_struct, 1);
+      xyt->nrows = 0;
+      g_ptr_array_add (print->prints, xyt);
     }
 
-  _minutiae.num = minutiae->len;
-  _minutiae.list = (struct fp_minutia **) minutiae->pdata;
-  _minutiae.alloc = minutiae->len;
-
-  xyt = g_new0 (struct xyt_struct, 1);
-  minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
-  g_ptr_array_add (print->prints, xyt);
+  if (image->data && image->width > 0 && image->height > 0)
+    {
+      FpiRidgeMap *rm = g_new0 (FpiRidgeMap, 1);
+      rm->width = image->width;
+      rm->height = image->height;
+      rm->data = g_memdup2 (image->data, image->width * image->height);
+      if (!print->ridge_templates)
+        print->ridge_templates = g_ptr_array_new_with_free_func (fpi_ridge_map_free);
+      g_ptr_array_add (print->ridge_templates, rm);
+    }
 
   g_clear_object (&print->image);
   print->image = g_object_ref (image);
@@ -194,11 +238,133 @@ fpi_print_add_from_image (FpPrint *print,
   return TRUE;
 }
 
+static double
+bilinear_sample (const double *data, int w, int h, double x, double y)
+{
+  if (x < 0 || x >= w - 1 || y < 0 || y >= h - 1)
+    return 0.0;
+  int x0 = (int) x, y0 = (int) y;
+  double fx = x - x0, fy = y - y0;
+  double v00 = data[y0 * w + x0];
+  double v10 = data[y0 * w + (x0 + 1)];
+  double v01 = data[(y0 + 1) * w + x0];
+  double v11 = data[(y0 + 1) * w + (x0 + 1)];
+  return (1.0 - fx) * (1.0 - fy) * v00 + fx * (1.0 - fy) * v10 +
+         (1.0 - fx) * fy * v01 + fx * fy * v11;
+}
+
+static double *
+ridge_map_to_norm_double (const FpiRidgeMap *rm)
+{
+  int n = rm->width * rm->height;
+  double *d = g_malloc (n * sizeof (double));
+  double sum = 0.0, sqsum = 0.0;
+  int i;
+
+  for (i = 0; i < n; i++)
+    {
+      d[i] = (double) rm->data[i] - 128.0;
+      sum += d[i];
+    }
+  double mean = sum / n;
+  for (i = 0; i < n; i++)
+    {
+      d[i] -= mean;
+      sqsum += d[i] * d[i];
+    }
+  double norm = sqrt (sqsum);
+  if (norm > 1e-6)
+    {
+      for (i = 0; i < n; i++)
+        d[i] /= norm;
+    }
+  return d;
+}
+
+static int
+match_normalized_ridge (const double *d1, const double *d2, int w, int h)
+{
+  double best_corr = -1.0;
+  static const double angles_deg[] = {-12.0, -6.0, 0.0, 6.0, 12.0};
+  double *rot_buf = g_malloc (w * h * sizeof (double));
+  int a;
+
+  for (a = 0; a < 5; a++)
+    {
+      double rad = angles_deg[a] * (G_PI / 180.0);
+      double cos_a = cos (rad), sin_a = sin (rad);
+      double cx = w / 2.0, cy = h / 2.0;
+
+      double rot_sqsum = 0.0;
+      int y, x;
+      for (y = 0; y < h; y++)
+        {
+          for (x = 0; x < w; x++)
+            {
+              double rot_x = cos_a * (x - cx) - sin_a * (y - cy) + cx;
+              double rot_y = sin_a * (x - cx) + cos_a * (y - cy) + cy;
+              double v = bilinear_sample (d1, w, h, rot_x, rot_y);
+              rot_buf[y * w + x] = v;
+              rot_sqsum += v * v;
+            }
+        }
+      if (rot_sqsum < 1e-6)
+        continue;
+
+      int dy, dx;
+      for (dy = -24; dy <= 24; dy += 2)
+        {
+          int y1a = dy > 0 ? dy : 0;
+          int y1b = dy > 0 ? h : h + dy;
+          int y2a = dy > 0 ? 0 : -dy;
+          int seg_h = y1b - y1a;
+          if (seg_h < 30)
+            continue;
+
+          for (dx = -20; dx <= 20; dx += 2)
+            {
+              int x1a = dx > 0 ? dx : 0;
+              int x1b = dx > 0 ? w : w + dx;
+              int x2a = dx > 0 ? 0 : -dx;
+              int seg_w = x1b - x1a;
+              if (seg_w < 25)
+                continue;
+
+              double dot = 0.0;
+              double e1 = 0.0, e2 = 0.0;
+              for (y = 0; y < seg_h; y++)
+                {
+                  int idx1 = (y1a + y) * w + x1a;
+                  int idx2 = (y2a + y) * w + x2a;
+                  for (x = 0; x < seg_w; x++)
+                    {
+                      double v1 = rot_buf[idx1 + x];
+                      double v2 = d2[idx2 + x];
+                      dot += v1 * v2;
+                      e1 += v1 * v1;
+                      e2 += v2 * v2;
+                    }
+                }
+              if (e1 > 1e-6 && e2 > 1e-6)
+                {
+                  double overlap_frac = (double)(seg_w * seg_h) / (w * h);
+                  double weight = pow (overlap_frac, 0.35);
+                  double c = (dot / (sqrt (e1) * sqrt (e2))) * weight;
+                  if (c > best_corr)
+                    best_corr = c;
+                }
+            }
+        }
+    }
+  g_free (rot_buf);
+  return (int) round (CLAMP (best_corr * 100.0, 0.0, 100.0));
+}
+
 /**
  * fpi_print_bz3_match:
  * @template: A #FpPrint containing one or more prints
  * @print: A newly scanned #FpPrint to test
- * @bz3_threshold: The BZ3 match threshold
+ * @bz3_threshold: The match threshold
  * @error: Return location for error
  *
  * Match the newly scanned @print (containing exactly one print) against the
@@ -222,6 +388,38 @@ fpi_print_bz3_match (FpPrint *template, FpPrint *print, gint bz3_threshold, GErr
       *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
                                          "It is only possible to match NBIS type print data");
       return FPI_MATCH_ERROR;
+    }
+
+  /* 2D Ridge Map Correlation Matching */
+  if (template->ridge_templates && template->ridge_templates->len > 0 &&
+      print->ridge_templates && print->ridge_templates->len > 0)
+    {
+      FpiRidgeMap *probe_rm = g_ptr_array_index (print->ridge_templates, 0);
+      double *probe_d = ridge_map_to_norm_double (probe_rm);
+      gint max_ridge_score = 0;
+      guint j;
+
+      for (j = 0; j < template->ridge_templates->len; j++)
+        {
+          FpiRidgeMap *gal_rm = g_ptr_array_index (template->ridge_templates, j);
+          if (gal_rm->width == probe_rm->width && gal_rm->height == probe_rm->height)
+            {
+              double *gal_d = ridge_map_to_norm_double (gal_rm);
+              gint s = match_normalized_ridge (probe_d, gal_d, probe_rm->width, probe_rm->height);
+              g_free (gal_d);
+              if (s > max_ridge_score)
+                max_ridge_score = s;
+            }
+        }
+      g_free (probe_d);
+
+      gint ridge_thresh = bz3_threshold > 0 ? bz3_threshold : 36;
+      fp_dbg ("2D Ridge Match: max_score = %d, threshold = %d", max_ridge_score, ridge_thresh);
+
+      if (max_ridge_score >= ridge_thresh)
+        return FPI_MATCH_SUCCESS;
+      else
+        return FPI_MATCH_FAIL;
     }
 
   if (print->prints->len != 1)

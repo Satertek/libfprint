@@ -23,6 +23,24 @@
 
 #include <nbis.h>
 
+typedef struct
+{
+  gint    width;
+  gint    height;
+  guchar *data;
+} FpiRidgeMap;
+
+static inline void
+fpi_ridge_map_free (gpointer p)
+{
+  FpiRidgeMap *rm = p;
+  if (rm)
+    {
+      g_free (rm->data);
+      g_free (rm);
+    }
+}
+
 struct _FpPrint
 {
   GInitiallyUnowned parent_instance;
@@ -43,4 +61,5 @@ struct _FpPrint
 
   GVariant  *data;
   GPtrArray *prints;
+  GPtrArray *ridge_templates;
 };

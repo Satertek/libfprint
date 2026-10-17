@@ -1,3 +1,16 @@
 *.o
 *.swp
 _build
+build/
+captures/
+install_staging/
+test-storage.variant
+*.pgm
+!data/*.pgm
+test_clean64/
+test_clean_diff/
+test_opt/
+test_prep/
+test_proc/
+test_proc_sub/
+test_scales/
