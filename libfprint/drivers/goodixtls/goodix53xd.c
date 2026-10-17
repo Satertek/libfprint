@@ -45,6 +45,7 @@
 #define GOODIX53XD_WIDTH 64
 #define GOODIX53XD_HEIGHT 80
 #define GOODIX53XD_SCAN_WIDTH 64
+#define GOODIX53XD_ENLARGE_FACTOR 3
 #define GOODIX53XD_FRAME_SIZE (GOODIX53XD_WIDTH * GOODIX53XD_HEIGHT)
 // For every 4 pixels there are 6 bytes and there are 8 extra start bytes and 5
 // extra end
@@ -402,34 +403,63 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
 /**
  * @brief Squashes the 12 bit pixels of a raw frame into 8 bit pixels used by libfprint.
  */
-static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
+static void squash_frame_linear(const Goodix53xdPix* frame, guint8* squashed)
 {
-    Goodix53xdPix min = 0xffff;
-    Goodix53xdPix max = 0;
+    int hist[4096] = {0};
+    int total = 0;
 
-    for (int y = 1; y < GOODIX53XD_HEIGHT - 1; ++y) {
-        for (int x = 1; x < GOODIX53XD_WIDTH - 1; ++x) {
-            const Goodix53xdPix pix = frame[x + y * GOODIX53XD_WIDTH];
-            if (pix < min) min = pix;
-            if (pix > max) max = pix;
+    for (int y = 2; y < GOODIX53XD_HEIGHT - 2; ++y) {
+        for (int x = 2; x < GOODIX53XD_WIDTH - 2; ++x) {
+            Goodix53xdPix pix = frame[x + y * GOODIX53XD_WIDTH];
+            if (pix < 4096) {
+                hist[pix]++;
+                total++;
+            }
+        }
+    }
+
+    if (total == 0) {
+        memset(squashed, 0xff, GOODIX53XD_FRAME_SIZE);
+        return;
+    }
+
+    int p_low_count = total * 2 / 100;
+    int p_high_count = total * 98 / 100;
+
+    int accum = 0;
+    Goodix53xdPix min = 0;
+    Goodix53xdPix max = 4095;
+    gboolean found_min = FALSE;
+
+    for (int i = 0; i < 4096; i++) {
+        accum += hist[i];
+        if (!found_min && accum >= p_low_count) {
+            min = i;
+            found_min = TRUE;
+        }
+        if (accum >= p_high_count) {
+            max = i;
+            break;
         }
     }
 
     if (max <= min) {
-        memset(squashed, 0xff, GOODIX53XD_FRAME_SIZE);
-        return;
+        max = min + 1;
     }
 
     for (int y = 0; y < GOODIX53XD_HEIGHT; ++y) {
         for (int x = 0; x < GOODIX53XD_WIDTH; ++x) {
             int idx = x + y * GOODIX53XD_WIDTH;
-            if (x == 0 || x == GOODIX53XD_WIDTH - 1 || y == 0 || y == GOODIX53XD_HEIGHT - 1) {
+            if (x < 2 || x >= GOODIX53XD_WIDTH - 2 || y < 2 || y >= GOODIX53XD_HEIGHT - 2) {
                 squashed[idx] = 0xff;
             } else {
                 Goodix53xdPix pix = frame[idx];
-                if (pix < min) pix = min;
-                if (pix > max) pix = max;
-                squashed[idx] = (guint8)((pix - min) * 0xff / (max - min));
+                if (pix <= min)
+                    squashed[idx] = 0x00;
+                else if (pix >= max)
+                    squashed[idx] = 0xff;
+                else
+                    squashed[idx] = (guint8)((pix - min) * 255 / (max - min));
             }
         }
     }
@@ -454,8 +484,12 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
     }
     fp_dbg("Decoded frame: raw min=%u, max=%u", rmin, rmax);
 
-    FpImage* img = fp_image_new(GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
-    squash_frame_linear(raw_frame, img->data);
+    FpImage* tmp = fp_image_new(GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+    tmp->flags = FPI_IMAGE_PARTIAL;
+    squash_frame_linear(raw_frame, tmp->data);
+
+    FpImage* img = fpi_image_resize(tmp, GOODIX53XD_ENLARGE_FACTOR, GOODIX53XD_ENLARGE_FACTOR);
+    g_object_unref(tmp);
 
     fpi_image_device_image_captured(img_dev, img);
     fpi_image_device_report_finger_status(img_dev, FALSE);
@@ -747,8 +781,8 @@ static void fpi_device_goodixtls53xd_class_init(
   dev_class->nr_enroll_stages = 10;
 
   img_dev_class->bz3_threshold = 18;
-  img_dev_class->img_width = GOODIX53XD_WIDTH;
-  img_dev_class->img_height = GOODIX53XD_HEIGHT;
+  img_dev_class->img_width = GOODIX53XD_WIDTH * GOODIX53XD_ENLARGE_FACTOR;
+  img_dev_class->img_height = GOODIX53XD_HEIGHT * GOODIX53XD_ENLARGE_FACTOR;
 
   img_dev_class->img_open = dev_init;
   img_dev_class->img_close = dev_deinit;
