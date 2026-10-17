@@ -783,7 +783,7 @@ void goodix_send_query_mcu_state_raw(FpDevice *dev,
     goodix_send_protocol(dev, GOODIX_CMD_QUERY_MCU_STATE,
                          (guint8 *)payload, length, NULL, TRUE,
                          GOODIX_TIMEOUT, reply,
-                         reply ? goodix_receive_default : (GoodixCmdCallback)goodix_receive_none,
+                         goodix_receive_default,
                          cb_info);
     return;
   }
