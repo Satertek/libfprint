@@ -21,7 +21,6 @@ glib_min_version = '2.56'
 glib_version_def = 'GLIB_VERSION_@0@_@1@'.format(
     glib_min_version.split('.')[0], glib_min_version.split('.')[1])
 common_cflags = cc.get_supported_arguments([
-    '-Wno-incompatible-pointer-types',
     '-Wall',
     '-Wcast-align',
     '-Wformat-nonliteral',

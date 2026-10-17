@@ -177,7 +177,7 @@ void goodix_receive_preset_psk_read(FpDevice *dev, guint8 *data, guint16 length,
     return;
   }
 
-  if (length < sizeof(guint8) + sizeof(GoodixPresetPsk)) {
+  if (length < sizeof(guint8) + sizeof(GoodixPresetPskResponse)) {
     g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                 "Invalid preset PSK read reply length: %d", length);
     callback(dev, FALSE, 0x00000000, NULL, 0, cb_info->user_data, error);
@@ -185,7 +185,7 @@ void goodix_receive_preset_psk_read(FpDevice *dev, guint8 *data, guint16 length,
   }
   
   GoodixPresetPskResponse* response = (GoodixPresetPskResponse*) (data + sizeof(guint8));
-  psk_len = response->length;
+  psk_len = GUINT32_FROM_LE(response->length);
   if (length < psk_len + sizeof(guint8) + sizeof(GoodixPresetPskResponse)) {
     g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                 "Invalid preset PSK read reply length: %d", length);
@@ -976,19 +976,19 @@ void goodix_send_tls_successfully_established(FpDevice *dev,
 
     goodix_send_protocol(dev, GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED,
                          (guint8 *)&payload, sizeof(payload), NULL, TRUE,
-                         GOODIX_TIMEOUT, FALSE, goodix_receive_none, cb_info);
+                         10, FALSE, goodix_receive_none, cb_info);
     return;
   }
 
   goodix_send_protocol(dev, GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED,
                        (guint8 *)&payload, sizeof(payload), NULL, TRUE,
-                       GOODIX_TIMEOUT, FALSE, NULL, NULL);
+                       10, FALSE, NULL, NULL);
 }
 
 void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
                           gpointer user_data)
 {
-    guint8 payload = {0x40, 0x00};
+    GoodixNone payload = {};
     GoodixCallbackInfo* cb_info;
 
     if (callback) {
@@ -1373,11 +1373,13 @@ static void goodix_tls_ready_image_handler(FpDevice* dev, guint8* data,
     int read_size = goodix_tls_server_receive(priv->tls_hop, buff, size, &err);
     if (read_size <= 0) {
         callback(dev, NULL, 0, cb_info->user_data, err);
+        free(buff);
         g_free(cb_info);
         return;
     }
 
     callback(dev, buff, read_size, cb_info->user_data, NULL);
+    free(buff);
     g_free(cb_info);
 }
 
@@ -1399,7 +1401,7 @@ void goodix_tls_read_image(FpDevice* dev, guint8* payload, guint16 length, Goodi
     goodix_shutdown_tls(dev, &derr);
 
     g_free(priv->pending_img_payload);
-    priv->pending_img_payload = g_memdup(payload, length);
+    priv->pending_img_payload = g_memdup2(payload, length);
     priv->pending_img_len = length;
     priv->pending_img_cb = cb_info;
     priv->pending_img_retries = 0;

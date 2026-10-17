@@ -38,15 +38,12 @@
 #include "goodix.h"
 #include "goodixtls.h"
 
-static GError* err_from_ssl()
+static GError* err_from_ssl(void)
 {
-    GError* err = malloc(sizeof(GError));
     unsigned long code = ERR_get_error();
-    err->code = code;
     const char* msg = ERR_reason_error_string(code);
-    err->message = malloc(strlen(msg));
-    strcpy(err->message, msg);
-    return err;
+    return g_error_new_literal(G_IO_ERROR, G_IO_ERROR_FAILED,
+                               msg ? msg : "OpenSSL error");
 }
 
 static unsigned int tls_server_psk_server_callback(SSL *ssl,
@@ -132,11 +129,13 @@ static void* goodix_tls_init_serve(void* me)
 gboolean goodix_tls_server_deinit(GoodixTlsServer* self, GError** error)
 {
     SSL_shutdown(self->ssl_layer);
-    SSL_free(self->ssl_layer);
 
     close(self->client_fd);
     close(self->sock_fd);
 
+    pthread_join(self->serve_thread, NULL);
+
+    SSL_free(self->ssl_layer);
     SSL_CTX_free(self->ssl_ctx);
 
     return TRUE;

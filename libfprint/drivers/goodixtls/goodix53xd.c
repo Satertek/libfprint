@@ -639,11 +639,12 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
                                            sizeof(fdt_switch_state_down_53xd), FALSE, NULL,
                                            receive_fdt_down_ack, ssm);
         break;
-    case SCAN_STAGE_GET_IMG:
+    case SCAN_STAGE_GET_IMG: {
         fpi_image_device_report_finger_status(img_dev, TRUE);
-        guint8 payload = {0x05, 0x03};
+        guint16 payload = 0x0305;
         goodix_send_write_sensor_register(dev, 556, payload, write_sensor_complete, ssm);
         break;
+    }
     }
 }
 
@@ -666,6 +667,7 @@ static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *err
 {
     if (error) {
         fp_err("failed to scan: %s (code: %d)", error->message, error->code);
+        fpi_ssm_mark_failed(user_data, error);
         return;
     }
     scan_get_img(dev, user_data);
@@ -675,6 +677,7 @@ static void scan_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
 {
     if (error) {
         fp_err("failed to scan: %s (code: %d)", error->message, error->code);
+        fpi_image_device_session_error(FP_IMAGE_DEVICE(dev), error);
         return;
     }
     fp_dbg("finished scan");
