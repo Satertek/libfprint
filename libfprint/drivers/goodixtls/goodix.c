@@ -976,13 +976,13 @@ void goodix_send_tls_successfully_established(FpDevice *dev,
 
     goodix_send_protocol(dev, GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED,
                          (guint8 *)&payload, sizeof(payload), NULL, TRUE,
-                         10, FALSE, goodix_receive_none, cb_info);
+                         GOODIX_TIMEOUT, FALSE, goodix_receive_none, cb_info);
     return;
   }
 
   goodix_send_protocol(dev, GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED,
                        (guint8 *)&payload, sizeof(payload), NULL, TRUE,
-                       10, FALSE, NULL, NULL);
+                       GOODIX_TIMEOUT, FALSE, NULL, NULL);
 }
 
 void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
