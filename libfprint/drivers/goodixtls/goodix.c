@@ -451,6 +451,11 @@ void goodix_receive_timeout_cb(FpDevice *dev, gpointer user_data) {
       fpi_device_goodixtls_get_instance_private(self);
   GError *error = NULL;
 
+  if (!priv->ack && !priv->reply)
+    return;
+
+  priv->timeout = NULL;
+
   g_set_error(&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
               "Command timed out: 0x%02x", priv->cmd);
   goodix_receive_done(dev, NULL, 0, error);
@@ -595,14 +600,14 @@ void goodix_send_nop(FpDevice *dev, GoodixNoneCallback callback,
     cb_info->user_data = user_data;
 
     goodix_send_protocol(dev, GOODIX_CMD_NOP, (guint8 *)&payload,
-                         sizeof(payload), NULL, FALSE, GOODIX_TIMEOUT, FALSE,
+                         sizeof(payload), NULL, FALSE, 0, FALSE,
                          goodix_receive_none, cb_info);
     goodix_receive_done(dev, NULL, 0, NULL);
     return;
   }
 
   goodix_send_protocol(dev, GOODIX_CMD_NOP, (guint8 *)&payload, sizeof(payload),
-                       NULL, FALSE, GOODIX_TIMEOUT, FALSE, NULL, NULL);
+                       NULL, FALSE, 0, FALSE, NULL, NULL);
   goodix_receive_done(dev, NULL, 0, NULL);
 }
 
@@ -1127,6 +1132,7 @@ gboolean goodix_dev_init(FpDevice *dev, GError **error) {
   FpiDeviceGoodixTlsPrivate *priv =
       fpi_device_goodixtls_get_instance_private(self);
 
+  priv->cmd = 0;
   priv->timeout = NULL;
   priv->ack = FALSE;
   priv->reply = FALSE;
@@ -1147,6 +1153,7 @@ void goodix_reset_state(FpDevice* dev)
 
     if (priv->timeout)
         g_clear_pointer(&priv->timeout, g_source_destroy);
+    priv->cmd = 0;
     priv->ack = FALSE;
     priv->reply = FALSE;
     priv->callback = NULL;
