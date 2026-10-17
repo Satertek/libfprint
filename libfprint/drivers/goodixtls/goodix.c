@@ -743,6 +743,56 @@ void goodix_send_mcu_switch_to_idle_mode(FpDevice *dev, guint8 sleep_time,
                        GOODIX_TIMEOUT, FALSE, NULL, NULL);
 }
 
+void goodix_send_mcu_switch_to_sleep_mode(FpDevice *dev,
+                                          GoodixNoneCallback callback,
+                                          gpointer user_data) {
+  guint8 payload[] = {0x01, 0x00};
+  GoodixCallbackInfo *cb_info;
+
+  if (callback) {
+    cb_info = malloc(sizeof(GoodixCallbackInfo));
+
+    cb_info->callback = G_CALLBACK(callback);
+    cb_info->user_data = user_data;
+
+    goodix_send_protocol(dev, GOODIX_CMD_MCU_SWITCH_TO_SLEEP_MODE,
+                         payload, sizeof(payload), NULL, TRUE,
+                         GOODIX_TIMEOUT, FALSE, goodix_receive_none, cb_info);
+    return;
+  }
+
+  goodix_send_protocol(dev, GOODIX_CMD_MCU_SWITCH_TO_SLEEP_MODE,
+                       payload, sizeof(payload), NULL, TRUE,
+                       GOODIX_TIMEOUT, FALSE, NULL, NULL);
+}
+
+void goodix_send_query_mcu_state_raw(FpDevice *dev,
+                                     const guint8 *payload,
+                                     guint16 length,
+                                     gboolean reply,
+                                     GoodixDefaultCallback callback,
+                                     gpointer user_data) {
+  GoodixCallbackInfo *cb_info;
+
+  if (callback) {
+    cb_info = malloc(sizeof(GoodixCallbackInfo));
+
+    cb_info->callback = G_CALLBACK(callback);
+    cb_info->user_data = user_data;
+
+    goodix_send_protocol(dev, GOODIX_CMD_QUERY_MCU_STATE,
+                         (guint8 *)payload, length, NULL, TRUE,
+                         GOODIX_TIMEOUT, reply,
+                         reply ? goodix_receive_default : (GoodixCmdCallback)goodix_receive_none,
+                         cb_info);
+    return;
+  }
+
+  goodix_send_protocol(dev, GOODIX_CMD_QUERY_MCU_STATE,
+                       (guint8 *)payload, length, NULL, TRUE,
+                       GOODIX_TIMEOUT, reply, NULL, NULL);
+}
+
 void goodix_send_write_sensor_register(FpDevice *dev, guint16 address,
                                        guint16 value,
                                        GoodixNoneCallback callback,
