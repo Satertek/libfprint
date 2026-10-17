@@ -407,23 +407,30 @@ static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
     Goodix53xdPix min = 0xffff;
     Goodix53xdPix max = 0;
 
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        const Goodix53xdPix pix = frame[i];
-        if (pix < min) {
-            min = pix;
-        }
-        if (pix > max) {
-            max = pix;
+    for (int y = 1; y < GOODIX53XD_HEIGHT - 1; ++y) {
+        for (int x = 1; x < GOODIX53XD_WIDTH - 1; ++x) {
+            const Goodix53xdPix pix = frame[x + y * GOODIX53XD_WIDTH];
+            if (pix < min) min = pix;
+            if (pix > max) max = pix;
         }
     }
 
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        const Goodix53xdPix pix = frame[i];
-        if (pix - min == 0 || max - min == 0) {
-            squashed[i] = 0;
-        }
-        else {
-            squashed[i] = (pix - min) * 0xff / (max - min);
+    if (max <= min) {
+        memset(squashed, 0xff, GOODIX53XD_FRAME_SIZE);
+        return;
+    }
+
+    for (int y = 0; y < GOODIX53XD_HEIGHT; ++y) {
+        for (int x = 0; x < GOODIX53XD_WIDTH; ++x) {
+            int idx = x + y * GOODIX53XD_WIDTH;
+            if (x == 0 || x == GOODIX53XD_WIDTH - 1 || y == 0 || y == GOODIX53XD_HEIGHT - 1) {
+                squashed[idx] = 0xff;
+            } else {
+                Goodix53xdPix pix = frame[idx];
+                if (pix < min) pix = min;
+                if (pix > max) pix = max;
+                squashed[idx] = (guint8)((pix - min) * 0xff / (max - min));
+            }
         }
     }
 }
@@ -472,21 +479,6 @@ static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *err
     fpi_ssm_next_state(user_data);
 }
 
-static void on_finger_touched(FpDevice* dev, guint8* data, guint16 len,
-                              gpointer ssm, GError* err)
-{
-    if (err) {
-        fpi_ssm_mark_failed(ssm, err);
-        return;
-    }
-    gchar *str = data_to_str(data, len);
-    fp_dbg("0x32 reply len=%d data=%s", len, str);
-    g_free(str);
-    fp_dbg("Physical finger touch detected on sensor!");
-    fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
-    fpi_ssm_next_state(ssm);
-}
-
 static guint8 fdt_mode_zeroes_53xd[] = {
     0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
     0x24, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -508,6 +500,71 @@ static guint8 fdt_mode_thresholds_53xd[] = {
     0x88, 0x88, 0x00
 };
 
+static void update_fdt_thresholds(const guint8 *data, guint16 len)
+{
+    if (len < 20)
+        return;
+
+    const guint8 *fdt_data = data + 4;
+    for (int i = 0; i < 8; i++) {
+        guint16 fdt_val = fdt_data[i * 2] | (fdt_data[i * 2 + 1] << 8);
+        guint8 base_byte = (guint8)(fdt_val >> 1);
+        fdt_down_thresholds_53xd[10 + i * 2] = base_byte;
+        fdt_down_thresholds_53xd[10 + i * 2 + 1] = base_byte;
+        fdt_mode_thresholds_53xd[10 + i * 2] = base_byte;
+        fdt_mode_thresholds_53xd[10 + i * 2 + 1] = base_byte;
+    }
+    fp_dbg("Updated FDT thresholds from sensor baseline: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x",
+           fdt_down_thresholds_53xd[10], fdt_down_thresholds_53xd[12],
+           fdt_down_thresholds_53xd[14], fdt_down_thresholds_53xd[16],
+           fdt_down_thresholds_53xd[18], fdt_down_thresholds_53xd[20],
+           fdt_down_thresholds_53xd[22], fdt_down_thresholds_53xd[24]);
+}
+
+static void on_pre_fdt_mode_2(FpDevice* dev, guint8* data, guint16 len,
+                              gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    if (data && len >= 20) {
+        update_fdt_thresholds(data, len);
+    }
+    fpi_ssm_next_state(ssm);
+}
+
+static void on_finger_touched(FpDevice* dev, guint8* data, guint16 len,
+                              gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    gchar *str = data_to_str(data, len);
+    fp_dbg("0x32 reply len=%d data=%s", len, str);
+    g_free(str);
+
+    guint16 touch_flag = 0;
+    if (len >= 4) {
+        touch_flag = data[2] | (data[3] << 8);
+    }
+    fp_dbg("FDT touch_flag: 0x%04x", touch_flag);
+
+    if (touch_flag == 0) {
+        fp_dbg("Baseline/temperature drift event (touch_flag=0), updating baseline and re-arming...");
+        if (len >= 20) {
+            update_fdt_thresholds(data, len);
+        }
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_FDT_DOWN_1);
+        return;
+    }
+
+    fp_dbg("Physical finger touch detected on sensor (touch_flag=0x%04x)!", touch_flag);
+    fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
+    fpi_ssm_next_state(ssm);
+}
+
 static const guint8 query_mcu_state_53xd[] = { 0x01, 0x01, 0x01 };
 
 static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
@@ -524,7 +581,7 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
         fdt_mode_zeroes_53xd[26] = 0x01;
         goodix_send_mcu_switch_to_fdt_mode(dev, fdt_mode_zeroes_53xd,
                                            sizeof(fdt_mode_zeroes_53xd), TRUE, NULL,
-                                           check_none_cmd, ssm);
+                                           on_pre_fdt_mode_2, ssm);
         break;
 
     case SCAN_STAGE_SLEEP_MODE:
