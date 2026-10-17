@@ -1451,19 +1451,18 @@ void goodix_tls_read_image(FpDevice* dev, guint8* payload, guint16 length, Goodi
     cb_info->callback = G_CALLBACK(callback);
     cb_info->user_data = user_data;
 
-    /* The MCU drops the TLS session while it waits for the finger, so build a
-     * fresh TLS session before each image read, then send the pending request
-     * once the handshake completes. */
-    GError* derr = NULL;
-    goodix_shutdown_tls(dev, &derr);
-
     g_free(priv->pending_img_payload);
     priv->pending_img_payload = g_memdup2(payload, length);
     priv->pending_img_len = length;
     priv->pending_img_cb = cb_info;
     priv->pending_img_retries = 0;
 
-    goodix_tls(dev, goodix_send_pending_image, dev);
+    if (priv->tls_hop) {
+        goodix_send_mcu_get_image(dev, payload, length,
+                                  goodix_tls_ready_image_handler, cb_info);
+    } else {
+        goodix_tls(dev, goodix_send_pending_image, dev);
+    }
 }
 
 static void goodix_send_pending_image(FpDevice* dev, gpointer user_data,

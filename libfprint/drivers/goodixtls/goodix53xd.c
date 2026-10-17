@@ -63,6 +63,7 @@ struct _FpiDeviceGoodixTls53XD {
   GSList* frames;
 
   Goodix53xdPix empty_img[GOODIX53XD_FRAME_SIZE];
+  gboolean has_empty_img;
 };
 
 G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd, FPI,
@@ -207,46 +208,28 @@ static void check_config_upload(FpDevice* dev, gboolean success,
         fpi_ssm_next_state(user_data);
     }
 }
-static void check_powerdown_scan_freq(FpDevice* dev, gboolean success,
-                                      gpointer user_data, GError* error)
-{
-    if (error) {
-        fpi_ssm_mark_failed(user_data, error);
-    }
-    else if (!success) {
-        fpi_ssm_mark_failed(user_data,
-                            g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                                        "failed to set powerdown freq"));
-    }
-    fpi_ssm_next_state(user_data);
-}
 
-enum otp_write_states {
-    OTP_WRITE_1,
-    OTP_WRITE_2,
 
-    OTP_WRITE_NUM,
+static guint8 fdt_mode_zeroes_53xd[] = {
+    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
+    0x24, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00
 };
 
-static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
-{
-    /*FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    switch (fpi_ssm_get_cur_state(ssm)) {
-    case OTP_WRITE_1:
-        guint8 sensor1[] = {0x0a, 0x02};
-        goodix_send_write_sensor_register(
-        dev, 0x022c, sensor1, check_none,
-        ssm);
-        break;
-    case OTP_WRITE_2:
-        guint8 sensor2[] = {0x0a, 0x03};
-        goodix_send_write_sensor_register(
-            dev, 0x022c, sensor2, check_none,
-            ssm);
-        fpi_ssm_next_state(ssm);
-        break;
-    }*/
-}
+static guint8 fdt_down_thresholds_53xd[] = {
+    0x8c, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
+    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
+    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
+    0x88, 0x88, 0x00
+};
+
+static guint8 fdt_mode_thresholds_53xd[] = {
+    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
+    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
+    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
+    0x88, 0x88, 0x00
+};
 
 static void read_otp_callback(FpDevice* dev, guint8* data, guint16 len,
                               gpointer ssm, GError* err)
@@ -264,6 +247,34 @@ static void read_otp_callback(FpDevice* dev, guint8* data, guint16 len,
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     self->otp = malloc(64);
     memcpy(self->otp, data, len);
+
+    gchar *otp_str = data_to_str(self->otp, len);
+    fp_dbg("Device OTP (len %d): %s", len, otp_str);
+    g_free(otp_str);
+
+    guint8 fdt_dac0 = self->otp[33] ? self->otp[33] : 0x28;
+    guint8 fdt_dac1 = self->otp[41] ? self->otp[41] : 0x22;
+    guint8 fdt_dac2 = self->otp[42] ? self->otp[42] : 0x28;
+    guint8 fdt_dac3 = self->otp[43] ? self->otp[43] : 0x24;
+
+    fdt_mode_zeroes_53xd[2] = fdt_dac0;
+    fdt_mode_zeroes_53xd[4] = fdt_dac1;
+    fdt_mode_zeroes_53xd[6] = fdt_dac2;
+    fdt_mode_zeroes_53xd[8] = fdt_dac3;
+
+    fdt_down_thresholds_53xd[2] = fdt_dac0;
+    fdt_down_thresholds_53xd[4] = fdt_dac1;
+    fdt_down_thresholds_53xd[6] = fdt_dac2;
+    fdt_down_thresholds_53xd[8] = fdt_dac3;
+
+    fdt_mode_thresholds_53xd[2] = fdt_dac0;
+    fdt_mode_thresholds_53xd[4] = fdt_dac1;
+    fdt_mode_thresholds_53xd[6] = fdt_dac2;
+    fdt_mode_thresholds_53xd[8] = fdt_dac3;
+
+    fp_dbg("FDT DAC calibration: 0x%02x 0x%02x 0x%02x 0x%02x",
+           fdt_dac0, fdt_dac1, fdt_dac2, fdt_dac3);
+
     fpi_ssm_next_state(ssm);
 }
 
@@ -348,6 +359,9 @@ static void activate_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
 enum SCAN_STAGES {
     SCAN_STAGE_PRE_FDT_MODE_1,
     SCAN_STAGE_PRE_FDT_MODE_2,
+    SCAN_STAGE_CALIB_WRITE_SENSOR_1,
+    SCAN_STAGE_CALIB_GET_EMPTY_IMG,
+    SCAN_STAGE_CALIB_WRITE_SENSOR_2,
     SCAN_STAGE_SLEEP_MODE,
     SCAN_STAGE_QUERY_MCU_STATE,
     SCAN_STAGE_FDT_DOWN_1,
@@ -401,66 +415,152 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
 }
 
 /**
- * @brief Squashes the 12 bit pixels of a raw frame into 8 bit pixels used by libfprint.
+ * @brief Preprocesses raw frame by subtracting empty sensor background,
+ * normalizing contact area histogram, and applying 3x3 unsharp contrast enhancement.
  */
-static void squash_frame_linear(const Goodix53xdPix* frame, guint8* squashed)
+static void preprocess_and_squash_frame(FpiDeviceGoodixTls53XD* self,
+                                       const Goodix53xdPix* raw_frame,
+                                       guint8* squashed)
 {
-    int hist[4096] = {0};
-    int total = 0;
+    if (!self->has_empty_img) {
+        Goodix53xdPix min = 0xffff, max = 0;
+        for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+            if (raw_frame[i] < min) min = raw_frame[i];
+            if (raw_frame[i] > max) max = raw_frame[i];
+        }
+        if (max <= min) max = min + 1;
+        for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+            squashed[i] = (guint8) CLAMP(((int)raw_frame[i] - min) * 255 / (max - min), 0, 255);
+        }
+        return;
+    }
 
-    for (int y = 2; y < GOODIX53XD_HEIGHT - 2; ++y) {
-        for (int x = 2; x < GOODIX53XD_WIDTH - 2; ++x) {
-            Goodix53xdPix pix = frame[x + y * GOODIX53XD_WIDTH];
-            if (pix < 4096) {
-                hist[pix]++;
-                total++;
+    /* Step 1: Background subtraction with saturation thresholding */
+    int subtracted[GOODIX53XD_FRAME_SIZE];
+    gboolean is_contact[GOODIX53XD_FRAME_SIZE] = {FALSE};
+    int contact_count = 0;
+    int hist[256] = {0};
+
+    for (int y = 0; y < GOODIX53XD_HEIGHT; y++) {
+        for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
+            int idx = x + y * GOODIX53XD_WIDTH;
+            if (x < 2 || x >= GOODIX53XD_WIDTH - 2 || y < 2 || y >= GOODIX53XD_HEIGHT - 2) {
+                subtracted[idx] = 4095;
+                continue;
+            }
+
+            Goodix53xdPix raw_px = raw_frame[idx];
+            Goodix53xdPix bg_px = self->empty_img[idx];
+
+            /* If raw pixel is saturated near rail or diff exceeds touch threshold, it is non-contact (air) */
+            int val = 1000 + (int)raw_px - (int)bg_px;
+            if (raw_px >= 4090 || val > 1700) {
+                subtracted[idx] = 4095;
+            } else if (val < 0) {
+                subtracted[idx] = 0;
+                is_contact[idx] = TRUE;
+                contact_count++;
+                hist[0]++;
+            } else {
+                subtracted[idx] = val;
+                is_contact[idx] = TRUE;
+                contact_count++;
+                int h_idx = val / 16;
+                if (h_idx > 255) h_idx = 255;
+                hist[h_idx]++;
             }
         }
     }
 
-    if (total == 0) {
+    fp_dbg("Contact pixel coverage: %d / %d (%d%%)",
+           contact_count, (GOODIX53XD_WIDTH - 4) * (GOODIX53XD_HEIGHT - 4),
+           contact_count * 100 / ((GOODIX53XD_WIDTH - 4) * (GOODIX53XD_HEIGHT - 4)));
+
+    /* If very few contact pixels, clear to white background */
+    if (contact_count < 100) {
         memset(squashed, 0xff, GOODIX53XD_FRAME_SIZE);
         return;
     }
 
-    int p_low_count = total * 2 / 100;
-    int p_high_count = total * 98 / 100;
+    /* Step 2: Histogram equalization of contact pixels (0.1% to 99% range) */
+    hist[0] = 0;
+    hist[255] = 0;
+    int total_valid = 0;
+    for (int i = 1; i < 255; i++) {
+        total_valid += hist[i];
+    }
+    if (total_valid == 0) total_valid = 1;
 
     int accum = 0;
-    Goodix53xdPix min = 0;
-    Goodix53xdPix max = 4095;
-    gboolean found_min = FALSE;
+    int black_lvl = 0;
+    int white_lvl = 4095;
+    gboolean found_black = FALSE;
+    int p_low_count = total_valid * 1 / 1000;
+    int p_high_count = total_valid * 99 / 100;
 
-    for (int i = 0; i < 4096; i++) {
+    for (int i = 1; i < 255; i++) {
         accum += hist[i];
-        if (!found_min && accum >= p_low_count) {
-            min = i;
-            found_min = TRUE;
+        if (!found_black && accum >= p_low_count) {
+            black_lvl = i * 16;
+            found_black = TRUE;
         }
         if (accum >= p_high_count) {
-            max = i;
+            white_lvl = i * 16;
             break;
         }
     }
-
-    if (max <= min) {
-        max = min + 1;
+    if (white_lvl <= black_lvl) {
+        white_lvl = black_lvl + 16;
     }
 
-    for (int y = 0; y < GOODIX53XD_HEIGHT; ++y) {
-        for (int x = 0; x < GOODIX53XD_WIDTH; ++x) {
+    int res[GOODIX53XD_FRAME_SIZE];
+    for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+        if (!is_contact[i]) {
+            res[i] = 4095;
+        } else {
+            int px = subtracted[i];
+            if (px <= black_lvl)
+                res[i] = 0;
+            else if (px >= white_lvl)
+                res[i] = 4095;
+            else
+                res[i] = (px - black_lvl) * 4095 / (white_lvl - black_lvl);
+        }
+    }
+
+    /* Step 3: Local 3x3 Gaussian mean filter and unsharp contrast enhancement */
+    static const int mask[3][3] = {
+        {1, 2, 1},
+        {2, 4, 2},
+        {1, 2, 1}
+    };
+
+    for (int y = 0; y < GOODIX53XD_HEIGHT; y++) {
+        for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
             int idx = x + y * GOODIX53XD_WIDTH;
-            if (x < 2 || x >= GOODIX53XD_WIDTH - 2 || y < 2 || y >= GOODIX53XD_HEIGHT - 2) {
+            if (!is_contact[idx]) {
                 squashed[idx] = 0xff;
-            } else {
-                Goodix53xdPix pix = frame[idx];
-                if (pix <= min)
-                    squashed[idx] = 0x00;
-                else if (pix >= max)
-                    squashed[idx] = 0xff;
-                else
-                    squashed[idx] = (guint8)((pix - min) * 255 / (max - min));
+                continue;
             }
+
+            int weight_sum = 0;
+            int val_sum = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                int ny = y + dy;
+                if (ny < 0 || ny >= GOODIX53XD_HEIGHT) continue;
+                for (int dx = -1; dx <= 1; dx++) {
+                    int nx = x + dx;
+                    if (nx < 0 || nx >= GOODIX53XD_WIDTH) continue;
+                    int nidx = nx + ny * GOODIX53XD_WIDTH;
+                    int w = mask[dy + 1][dx + 1];
+                    weight_sum += w;
+                    val_sum += res[nidx] * w;
+                }
+            }
+            int mean_val = val_sum / weight_sum;
+            /* unsharp: 2 * res - mean_val */
+            int enhanced = 2 * res[idx] - mean_val;
+            squashed[idx] = (guint8) CLAMP(enhanced * 255 / 4095, 0, 255);
         }
     }
 }
@@ -474,6 +574,7 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
     }
 
     FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     Goodix53xdPix raw_frame[GOODIX53XD_FRAME_SIZE];
     decode_frame(raw_frame, data);
 
@@ -486,7 +587,7 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
 
     FpImage* tmp = fp_image_new(GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
     tmp->flags = FPI_IMAGE_PARTIAL;
-    squash_frame_linear(raw_frame, tmp->data);
+    preprocess_and_squash_frame(self, raw_frame, tmp->data);
 
     FpImage* img = fpi_image_resize(tmp, GOODIX53XD_ENLARGE_FACTOR, GOODIX53XD_ENLARGE_FACTOR);
     g_object_unref(tmp);
@@ -497,9 +598,40 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
     fpi_ssm_next_state(ssm);
 }
 
+static void on_read_empty_img(FpDevice* dev, guint8* data, guint16 len,
+                              gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    decode_frame(self->empty_img, data);
+    self->has_empty_img = TRUE;
+
+    Goodix53xdPix emin = 0xffff, emax = 0;
+    for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+        if (self->empty_img[i] < emin) emin = self->empty_img[i];
+        if (self->empty_img[i] > emax) emax = self->empty_img[i];
+    }
+    fp_dbg("Decoded empty background frame: min=%u, max=%u", emin, emax);
+
+    fpi_ssm_next_state(ssm);
+}
+
 static void scan_get_img(FpDevice* dev, FpiSsm* ssm)
 {
-    guint8 payload[] = {0x41, 0x03, 0xa5, 0x00, 0x9f, 0x00, 0xa5, 0x00, 0xa1, 0x00};
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    guint8 dac0 = (self->otp && self->otp[26]) ? self->otp[26] : 0xa5;
+    guint8 dac1 = (self->otp && self->otp[44]) ? self->otp[44] : (dac0 - 6);
+    guint8 dac2 = (self->otp && self->otp[45]) ? self->otp[45] : 0xa5;
+    guint8 dac3 = (self->otp && self->otp[46]) ? self->otp[46] : (dac2 - 4);
+
+    fp_dbg("Finger image DAC calibration: 0x%02x 0x%02x 0x%02x 0x%02x",
+           dac0, dac1, dac2, dac3);
+
+    guint8 payload[] = {0x41, 0x03, dac0, 0x00, dac1, 0x00, dac2, 0x00, dac3, 0x00};
     goodix_tls_read_image(dev, payload, sizeof(payload), scan_on_read_img, ssm);
 }
 
@@ -512,27 +644,6 @@ static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *err
     }
     fpi_ssm_next_state(user_data);
 }
-
-static guint8 fdt_mode_zeroes_53xd[] = {
-    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
-    0x24, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00
-};
-
-static guint8 fdt_down_thresholds_53xd[] = {
-    0x8c, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
-    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
-    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
-    0x88, 0x88, 0x00
-};
-
-static guint8 fdt_mode_thresholds_53xd[] = {
-    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
-    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
-    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
-    0x88, 0x88, 0x00
-};
 
 static void update_fdt_thresholds(const guint8 *data, guint16 len)
 {
@@ -565,7 +676,13 @@ static void on_pre_fdt_mode_2(FpDevice* dev, guint8* data, guint16 len,
     if (data && len >= 20) {
         update_fdt_thresholds(data, len);
     }
-    fpi_ssm_next_state(ssm);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    if (self->has_empty_img) {
+        /* Background baseline already captured, skip to sleep mode */
+        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SLEEP_MODE);
+    } else {
+        fpi_ssm_next_state(ssm);
+    }
 }
 
 static void on_finger_touched(FpDevice* dev, guint8* data, guint16 len,
@@ -603,6 +720,8 @@ static const guint8 query_mcu_state_53xd[] = { 0x01, 0x01, 0x01 };
 
 static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
 {
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
     switch (fpi_ssm_get_cur_state(ssm)) {
     case SCAN_STAGE_PRE_FDT_MODE_1:
         fdt_mode_zeroes_53xd[26] = 0x00;
@@ -617,6 +736,30 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
                                            sizeof(fdt_mode_zeroes_53xd), TRUE, NULL,
                                            on_pre_fdt_mode_2, ssm);
         break;
+
+    case SCAN_STAGE_CALIB_WRITE_SENSOR_1: {
+        guint16 payload = 0x030a;
+        goodix_send_write_sensor_register(dev, 0x022c, payload, write_sensor_complete, ssm);
+        break;
+    }
+
+    case SCAN_STAGE_CALIB_GET_EMPTY_IMG: {
+        guint8 dac0 = (self->otp && self->otp[33]) ? self->otp[33] : 0x28;
+        guint8 dac1 = (self->otp && self->otp[41]) ? self->otp[41] : 0x22;
+        guint8 dac2 = (self->otp && self->otp[42]) ? self->otp[42] : 0x28;
+        guint8 dac3 = (self->otp && self->otp[43]) ? self->otp[43] : 0x24;
+        guint8 payload[] = {0x01, 0x03, dac0, 0x01, dac1, 0x01, dac2, 0x01, dac3, 0x01};
+        fp_dbg("Capturing empty background frame with DAC: 0x%02x 0x%02x 0x%02x 0x%02x",
+               dac0, dac1, dac2, dac3);
+        goodix_tls_read_image(dev, payload, sizeof(payload), on_read_empty_img, ssm);
+        break;
+    }
+
+    case SCAN_STAGE_CALIB_WRITE_SENSOR_2: {
+        guint16 payload = 0x020a;
+        goodix_send_write_sensor_register(dev, 0x022c, payload, write_sensor_complete, ssm);
+        break;
+    }
 
     case SCAN_STAGE_SLEEP_MODE:
         goodix_send_mcu_switch_to_sleep_mode(dev, check_none_cmd_none, ssm);
@@ -732,7 +875,9 @@ static void dev_change_state(FpImageDevice* img_dev, FpiImageDeviceState state)
     }
 }
 
-static void goodix53xd_reset_state(FpiDeviceGoodixTls53XD* self) {}
+static void goodix53xd_reset_state(FpiDeviceGoodixTls53XD* self) {
+    self->has_empty_img = FALSE;
+}
 
 static void dev_deactivate(FpImageDevice *img_dev) {
     FpDevice* dev = FP_DEVICE(img_dev);
@@ -748,6 +893,8 @@ static void dev_deactivate(FpImageDevice *img_dev) {
 static void fpi_device_goodixtls53xd_init(FpiDeviceGoodixTls53XD* self)
 {
     self->frames = NULL;
+    self->has_empty_img = FALSE;
+    self->otp = NULL;
 }
 
 /* The TLS PSK is 32 zero bytes for the 538d (after the sensor has been
