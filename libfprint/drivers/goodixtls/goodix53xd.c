@@ -440,6 +440,13 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
     Goodix53xdPix raw_frame[GOODIX53XD_FRAME_SIZE];
     decode_frame(raw_frame, data);
 
+    Goodix53xdPix rmin = 0xffff, rmax = 0;
+    for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+        if (raw_frame[i] < rmin) rmin = raw_frame[i];
+        if (raw_frame[i] > rmax) rmax = raw_frame[i];
+    }
+    fp_dbg("Decoded frame: raw min=%u, max=%u", rmin, rmax);
+
     FpImage* img = fp_image_new(GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
     squash_frame_linear(raw_frame, img->data);
 
@@ -472,6 +479,9 @@ static void on_finger_touched(FpDevice* dev, guint8* data, guint16 len,
         fpi_ssm_mark_failed(ssm, err);
         return;
     }
+    gchar *str = data_to_str(data, len);
+    fp_dbg("0x32 reply len=%d data=%s", len, str);
+    g_free(str);
     fp_dbg("Physical finger touch detected on sensor!");
     fpi_image_device_report_finger_status(FP_IMAGE_DEVICE(dev), TRUE);
     fpi_ssm_next_state(ssm);
