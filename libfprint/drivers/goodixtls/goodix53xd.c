@@ -414,154 +414,112 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
     }
 }
 
+static int compare_doubles(const void* a, const void* b)
+{
+    double da = *(const double*)a;
+    double db = *(const double*)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+static void dump_pgm16(const Goodix53xdPix* frame, const char* path)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P5\n%d %d\n4095\n", GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+    for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
+        guint8 b[2] = { (guint8)(frame[i] >> 8), (guint8)(frame[i] & 0xff) };
+        fwrite(b, 1, 2, f);
+    }
+    fclose(f);
+}
+
+static void dump_pgm8(const guint8* frame, int w, int h, const char* path)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P5\n%d %d\n255\n", w, h);
+    fwrite(frame, 1, w * h, f);
+    fclose(f);
+}
+
+static void get_image_dac(FpiDeviceGoodixTls53XD* self, guint8 dac[4])
+{
+    dac[0] = (self->otp && self->otp[26]) ? self->otp[26] : 0xa5;
+    dac[1] = (self->otp && self->otp[44]) ? self->otp[44] : (dac[0] - 6);
+    dac[2] = (self->otp && self->otp[45]) ? self->otp[45] : 0xa5;
+    dac[3] = (self->otp && self->otp[46]) ? self->otp[46] : (dac[2] - 4);
+}
+
 /**
- * @brief Preprocesses raw frame by subtracting empty sensor background,
- * normalizing contact area histogram, and applying 3x3 unsharp contrast enhancement.
+ * @brief Preprocesses raw frame:
+ * 1. Subtracts matching empty-sensor baseline frame (canceling fixed die noise).
+ * 2. Removes 1D column & row readout amplifier offsets.
+ * 3. Applies robust percentile contrast stretching (p2..p98).
+ * 4. Inverts so finger ridges are dark (0) and valleys/air are light (255) for NBIS.
  */
 static void preprocess_and_squash_frame(FpiDeviceGoodixTls53XD* self,
                                        const Goodix53xdPix* raw_frame,
                                        guint8* squashed)
 {
-    if (!self->has_empty_img) {
-        Goodix53xdPix min = 0xffff, max = 0;
+    dump_pgm16(raw_frame, "/tmp/goodix_raw_finger.pgm");
+
+    double diff[GOODIX53XD_FRAME_SIZE];
+    if (self->has_empty_img) {
+        dump_pgm16(self->empty_img, "/tmp/goodix_raw_empty.pgm");
         for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
-            if (raw_frame[i] < min) min = raw_frame[i];
-            if (raw_frame[i] > max) max = raw_frame[i];
+            diff[i] = (double)raw_frame[i] - (double)self->empty_img[i];
         }
-        if (max <= min) max = min + 1;
+    } else {
         for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
-            squashed[i] = (guint8) CLAMP(((int)raw_frame[i] - min) * 255 / (max - min), 0, 255);
+            diff[i] = (double)raw_frame[i];
         }
-        return;
     }
 
-    /* Step 1: Background subtraction with saturation thresholding */
-    int subtracted[GOODIX53XD_FRAME_SIZE];
-    gboolean is_contact[GOODIX53XD_FRAME_SIZE] = {FALSE};
-    int contact_count = 0;
-    int hist[256] = {0};
+    /* Step 2: Remove residual row & column fixed pattern offsets */
+    double row_mean[GOODIX53XD_HEIGHT] = {0};
+    double col_mean[GOODIX53XD_WIDTH] = {0};
+    double grand_mean = 0;
 
     for (int y = 0; y < GOODIX53XD_HEIGHT; y++) {
         for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
+            double v = diff[x + y * GOODIX53XD_WIDTH];
+            row_mean[y] += v;
+            col_mean[x] += v;
+            grand_mean += v;
+        }
+        row_mean[y] /= GOODIX53XD_WIDTH;
+    }
+    grand_mean /= GOODIX53XD_FRAME_SIZE;
+    for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
+        col_mean[x] /= GOODIX53XD_HEIGHT;
+    }
+
+    double clean[GOODIX53XD_FRAME_SIZE];
+    for (int y = 0; y < GOODIX53XD_HEIGHT; y++) {
+        for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
             int idx = x + y * GOODIX53XD_WIDTH;
-            if (x < 2 || x >= GOODIX53XD_WIDTH - 2 || y < 2 || y >= GOODIX53XD_HEIGHT - 2) {
-                subtracted[idx] = 4095;
-                continue;
-            }
-
-            Goodix53xdPix raw_px = raw_frame[idx];
-            Goodix53xdPix bg_px = self->empty_img[idx];
-
-            /* If raw pixel is saturated near rail or diff exceeds touch threshold, it is non-contact (air) */
-            int val = 1000 + (int)raw_px - (int)bg_px;
-            if (raw_px >= 4090 || val > 1700) {
-                subtracted[idx] = 4095;
-            } else if (val < 0) {
-                subtracted[idx] = 0;
-                is_contact[idx] = TRUE;
-                contact_count++;
-                hist[0]++;
-            } else {
-                subtracted[idx] = val;
-                is_contact[idx] = TRUE;
-                contact_count++;
-                int h_idx = val / 16;
-                if (h_idx > 255) h_idx = 255;
-                hist[h_idx]++;
-            }
+            clean[idx] = diff[idx] - row_mean[y] - col_mean[x] + grand_mean;
         }
     }
 
-    fp_dbg("Contact pixel coverage: %d / %d (%d%%)",
-           contact_count, (GOODIX53XD_WIDTH - 4) * (GOODIX53XD_HEIGHT - 4),
-           contact_count * 100 / ((GOODIX53XD_WIDTH - 4) * (GOODIX53XD_HEIGHT - 4)));
+    /* Step 3: Percentile contrast stretching (2nd to 98th percentile) */
+    double sorted[GOODIX53XD_FRAME_SIZE];
+    memcpy(sorted, clean, sizeof(clean));
+    qsort(sorted, GOODIX53XD_FRAME_SIZE, sizeof(double), compare_doubles);
 
-    /* If very few contact pixels, clear to white background */
-    if (contact_count < 100) {
-        memset(squashed, 0xff, GOODIX53XD_FRAME_SIZE);
-        return;
-    }
+    double p_low = sorted[(int)(GOODIX53XD_FRAME_SIZE * 0.02)];
+    double p_high = sorted[(int)(GOODIX53XD_FRAME_SIZE * 0.98)];
+    if (p_high <= p_low) p_high = p_low + 1.0;
 
-    /* Step 2: Histogram equalization of contact pixels (0.1% to 99% range) */
-    hist[0] = 0;
-    hist[255] = 0;
-    int total_valid = 0;
-    for (int i = 1; i < 255; i++) {
-        total_valid += hist[i];
-    }
-    if (total_valid == 0) total_valid = 1;
+    fp_dbg("Clean diff stats: min=%.1f, p2=%.1f, med=%.1f, p98=%.1f, max=%.1f",
+           sorted[0], p_low, sorted[GOODIX53XD_FRAME_SIZE / 2], p_high, sorted[GOODIX53XD_FRAME_SIZE - 1]);
 
-    int accum = 0;
-    int black_lvl = 0;
-    int white_lvl = 4095;
-    gboolean found_black = FALSE;
-    int p_low_count = total_valid * 1 / 1000;
-    int p_high_count = total_valid * 99 / 100;
-
-    for (int i = 1; i < 255; i++) {
-        accum += hist[i];
-        if (!found_black && accum >= p_low_count) {
-            black_lvl = i * 16;
-            found_black = TRUE;
-        }
-        if (accum >= p_high_count) {
-            white_lvl = i * 16;
-            break;
-        }
-    }
-    if (white_lvl <= black_lvl) {
-        white_lvl = black_lvl + 16;
-    }
-
-    int res[GOODIX53XD_FRAME_SIZE];
+    /* Step 4: Map to 8-bit [0..255] with ridges as dark (0) and valleys/air as light (255) */
     for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
-        if (!is_contact[i]) {
-            res[i] = 4095;
-        } else {
-            int px = subtracted[i];
-            if (px <= black_lvl)
-                res[i] = 0;
-            else if (px >= white_lvl)
-                res[i] = 4095;
-            else
-                res[i] = (px - black_lvl) * 4095 / (white_lvl - black_lvl);
-        }
-    }
-
-    /* Step 3: Local 3x3 Gaussian mean filter and unsharp contrast enhancement */
-    static const int mask[3][3] = {
-        {1, 2, 1},
-        {2, 4, 2},
-        {1, 2, 1}
-    };
-
-    for (int y = 0; y < GOODIX53XD_HEIGHT; y++) {
-        for (int x = 0; x < GOODIX53XD_WIDTH; x++) {
-            int idx = x + y * GOODIX53XD_WIDTH;
-            if (!is_contact[idx]) {
-                squashed[idx] = 0xff;
-                continue;
-            }
-
-            int weight_sum = 0;
-            int val_sum = 0;
-            for (int dy = -1; dy <= 1; dy++) {
-                int ny = y + dy;
-                if (ny < 0 || ny >= GOODIX53XD_HEIGHT) continue;
-                for (int dx = -1; dx <= 1; dx++) {
-                    int nx = x + dx;
-                    if (nx < 0 || nx >= GOODIX53XD_WIDTH) continue;
-                    int nidx = nx + ny * GOODIX53XD_WIDTH;
-                    int w = mask[dy + 1][dx + 1];
-                    weight_sum += w;
-                    val_sum += res[nidx] * w;
-                }
-            }
-            int mean_val = val_sum / weight_sum;
-            /* unsharp: 2 * res - mean_val */
-            int enhanced = 2 * res[idx] - mean_val;
-            squashed[idx] = (guint8) CLAMP(enhanced * 255 / 4095, 0, 255);
-        }
+        double norm = (clean[i] - p_low) * 255.0 / (p_high - p_low);
+        squashed[i] = (guint8) CLAMP(255 - (int)round(norm), 0, 255);
     }
 }
 
@@ -579,18 +537,23 @@ static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
     decode_frame(raw_frame, data);
 
     Goodix53xdPix rmin = 0xffff, rmax = 0;
+    guint32 rsum = 0;
     for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
         if (raw_frame[i] < rmin) rmin = raw_frame[i];
         if (raw_frame[i] > rmax) rmax = raw_frame[i];
+        rsum += raw_frame[i];
     }
-    fp_dbg("Decoded frame: raw min=%u, max=%u", rmin, rmax);
+    fp_dbg("Decoded finger frame: raw min=%u, max=%u, mean=%.1f",
+           rmin, rmax, (double)rsum / GOODIX53XD_FRAME_SIZE);
 
     FpImage* tmp = fp_image_new(GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
     tmp->flags = FPI_IMAGE_PARTIAL;
     preprocess_and_squash_frame(self, raw_frame, tmp->data);
+    dump_pgm8(tmp->data, GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT, "/tmp/goodix_processed_64x80.pgm");
 
     FpImage* img = fpi_image_resize(tmp, GOODIX53XD_ENLARGE_FACTOR, GOODIX53XD_ENLARGE_FACTOR);
     g_object_unref(tmp);
+    dump_pgm8(img->data, img->width, img->height, "/tmp/goodix_processed_192x240.pgm");
 
     fpi_image_device_image_captured(img_dev, img);
     fpi_image_device_report_finger_status(img_dev, FALSE);
@@ -609,13 +572,17 @@ static void on_read_empty_img(FpDevice* dev, guint8* data, guint16 len,
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     decode_frame(self->empty_img, data);
     self->has_empty_img = TRUE;
+    dump_pgm16(self->empty_img, "/tmp/goodix_raw_empty.pgm");
 
     Goodix53xdPix emin = 0xffff, emax = 0;
+    guint32 esum = 0;
     for (int i = 0; i < GOODIX53XD_FRAME_SIZE; i++) {
         if (self->empty_img[i] < emin) emin = self->empty_img[i];
         if (self->empty_img[i] > emax) emax = self->empty_img[i];
+        esum += self->empty_img[i];
     }
-    fp_dbg("Decoded empty background frame: min=%u, max=%u", emin, emax);
+    fp_dbg("Decoded empty background frame: min=%u, max=%u, mean=%.1f",
+           emin, emax, (double)esum / GOODIX53XD_FRAME_SIZE);
 
     fpi_ssm_next_state(ssm);
 }
@@ -623,17 +590,16 @@ static void on_read_empty_img(FpDevice* dev, guint8* data, guint16 len,
 static void scan_get_img(FpDevice* dev, FpiSsm* ssm)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    guint8 dac0 = (self->otp && self->otp[26]) ? self->otp[26] : 0xa5;
-    guint8 dac1 = (self->otp && self->otp[44]) ? self->otp[44] : (dac0 - 6);
-    guint8 dac2 = (self->otp && self->otp[45]) ? self->otp[45] : 0xa5;
-    guint8 dac3 = (self->otp && self->otp[46]) ? self->otp[46] : (dac2 - 4);
+    guint8 dac[4];
+    get_image_dac(self, dac);
 
     fp_dbg("Finger image DAC calibration: 0x%02x 0x%02x 0x%02x 0x%02x",
-           dac0, dac1, dac2, dac3);
+           dac[0], dac[1], dac[2], dac[3]);
 
-    guint8 payload[] = {0x41, 0x03, dac0, 0x00, dac1, 0x00, dac2, 0x00, dac3, 0x00};
+    guint8 payload[] = {0x41, 0x03, dac[0], 0x00, dac[1], 0x00, dac[2], 0x00, dac[3], 0x00};
     goodix_tls_read_image(dev, payload, sizeof(payload), scan_on_read_img, ssm);
 }
+
 
 static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *error) 
 {
@@ -738,19 +704,17 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
 
     case SCAN_STAGE_CALIB_WRITE_SENSOR_1: {
-        guint16 payload = 0x030a;
+        guint16 payload = 0x0305;
         goodix_send_write_sensor_register(dev, 0x022c, payload, write_sensor_complete, ssm);
         break;
     }
 
     case SCAN_STAGE_CALIB_GET_EMPTY_IMG: {
-        guint8 dac0 = (self->otp && self->otp[33]) ? self->otp[33] : 0x28;
-        guint8 dac1 = (self->otp && self->otp[41]) ? self->otp[41] : 0x22;
-        guint8 dac2 = (self->otp && self->otp[42]) ? self->otp[42] : 0x28;
-        guint8 dac3 = (self->otp && self->otp[43]) ? self->otp[43] : 0x24;
-        guint8 payload[] = {0x01, 0x03, dac0, 0x01, dac1, 0x01, dac2, 0x01, dac3, 0x01};
+        guint8 dac[4];
+        get_image_dac(self, dac);
+        guint8 payload[] = {0x41, 0x03, dac[0], 0x00, dac[1], 0x00, dac[2], 0x00, dac[3], 0x00};
         fp_dbg("Capturing empty background frame with DAC: 0x%02x 0x%02x 0x%02x 0x%02x",
-               dac0, dac1, dac2, dac3);
+               dac[0], dac[1], dac[2], dac[3]);
         goodix_tls_read_image(dev, payload, sizeof(payload), on_read_empty_img, ssm);
         break;
     }
@@ -927,7 +891,7 @@ static void fpi_device_goodixtls53xd_class_init(
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->nr_enroll_stages = 10;
 
-  img_dev_class->bz3_threshold = 18;
+  img_dev_class->bz3_threshold = 24;
   img_dev_class->img_width = GOODIX53XD_WIDTH * GOODIX53XD_ENLARGE_FACTOR;
   img_dev_class->img_height = GOODIX53XD_HEIGHT * GOODIX53XD_ENLARGE_FACTOR;
 
